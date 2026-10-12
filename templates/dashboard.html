@@ -1,0 +1,572 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Strava Commute Analyzer</title>
+
+  <!-- Leaflet CSS -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"/>
+  <!-- App CSS -->
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body class="app">
+
+<!-- ── Sidebar ─────────────────────────────────────────────────── -->
+<aside class="sidebar" id="sidebar">
+  <div class="sidebar-header">
+    <div class="athlete-info">
+      {% if athlete.get('profile_medium') %}
+      <img src="{{ athlete.profile_medium }}" class="avatar" alt="avatar">
+      {% endif %}
+      <div>
+        <div class="athlete-name">{{ athlete.get('firstname','') }} {{ athlete.get('lastname','') }}</div>
+        <div class="athlete-sub">Strava Commute Analyzer</div>
+      </div>
+    </div>
+    <a href="/logout" class="btn-logout" title="Logout">⏻</a>
+  </div>
+
+  <!-- Filtri -->
+  <div class="sidebar-filters">
+    <label class="filter-row">
+      <input type="checkbox" id="chkCommute"> Solo commute
+    </label>
+    <select id="selType" class="select-sm">
+      <option value="">Tutti i tipi</option>
+      <option value="Ride">Bici</option>
+      <option value="Run">Corsa</option>
+      <option value="Walk">Camminata</option>
+      <option value="EBikeRide">E-Bike</option>
+    </select>
+    <button class="btn btn-sm btn-secondary" id="btnRefresh" title="Aggiorna da Strava">↻ Aggiorna</button>
+  </div>
+
+  <!-- Pre-caricamento GPS -->
+  <div class="precache-box" id="precacheBox">
+    <div class="precache-header">
+      <span>⚡ Pre-carica GPS</span>
+      <button class="btn btn-sm btn-primary" id="btnPrecache">Avvia</button>
+    </div>
+    <div class="precache-sub">Scarica tutti gli stream GPS ora → analisi istantanea</div>
+    <div class="progress-wrap" id="progressWrap" style="display:none">
+      <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+      <div class="progress-label" id="progressLabel">0 / 0</div>
+    </div>
+    <div class="precache-log" id="precacheLog"></div>
+  </div>
+
+  <!-- Lista attività -->
+  <div class="act-list-header">
+    <span id="actCount">0 attività</span>
+    <label class="select-all-label">
+      <input type="checkbox" id="chkSelectAll"> Seleziona tutte
+    </label>
+  </div>
+  <div class="act-list" id="actList">
+    <div class="loading-msg">Caricamento attività…</div>
+  </div>
+
+  <!-- Stats rapide -->
+  <div class="quick-stats" id="quickStats" style="display:none">
+    <div class="stat-item"><span class="stat-val" id="qsAvg">—</span><span class="stat-lbl">Tempo medio</span></div>
+    <div class="stat-item"><span class="stat-val" id="qsMin">—</span><span class="stat-lbl">Minimo</span></div>
+    <div class="stat-item"><span class="stat-val" id="qsMax">—</span><span class="stat-lbl">Massimo</span></div>
+    <div class="stat-item"><span class="stat-val" id="qsCount">—</span><span class="stat-lbl">Campioni</span></div>
+  </div>
+</aside>
+
+<!-- ── Main ────────────────────────────────────────────────────── -->
+<main class="main-area">
+
+  <!-- Toolbar analisi -->
+  <div class="toolbar">
+    <div class="toolbar-tabs">
+      <button class="tab-btn active" data-tab="routes">🗺 Percorsi</button>
+      <button class="tab-btn" data-tab="points">⏱ Tempo A→B</button>
+      <button class="tab-btn" data-tab="stops">🛑 Soste</button>
+      <button class="tab-btn" data-tab="stats">📊 Statistiche</button>
+    </div>
+
+    <!-- Tab: Tempo A→B -->
+    <div class="tab-panel" id="tab-points" style="display:none">
+      <span class="hint">Clicca sulla mappa per impostare i punti</span>
+      <div class="point-btns">
+        <button class="btn btn-sm" id="btnSetA" data-point="A">📍 Punto A</button>
+        <button class="btn btn-sm" id="btnSetB" data-point="B">📍 Punto B</button>
+        <input type="number" id="inpRadius" value="50" min="10" max="500" step="10" title="Raggio in metri">
+        <span class="unit-label">m</span>
+        <button class="btn btn-sm btn-primary" id="btnAnalyze">Analizza</button>
+        <button class="btn btn-sm btn-ghost" id="btnClearPoints">✕ Pulisci</button>
+      </div>
+      <div class="results-row" id="resultsRow" style="display:none">
+        <div class="res-stat"><span class="res-val" id="resAvg">—</span><span class="res-lbl">Media</span></div>
+        <div class="res-stat"><span class="res-val" id="resMedian">—</span><span class="res-lbl">Mediana</span></div>
+        <div class="res-stat"><span class="res-val" id="resMin">—</span><span class="res-lbl">Migliore</span></div>
+        <div class="res-stat"><span class="res-val" id="resMax">—</span><span class="res-lbl">Peggiore</span></div>
+        <div class="res-stat"><span class="res-val" id="resSamples">—</span><span class="res-lbl">Campioni</span></div>
+      </div>
+    </div>
+
+    <!-- Tab: Soste -->
+    <div class="tab-panel" id="tab-stops" style="display:none">
+      <span class="hint">Seleziona un'attività per vedere soste e velocità</span>
+      <label>Soglia velocità:
+        <input type="number" id="inpSpeedThreshold" value="2" min="0.5" max="10" step="0.5">
+        km/h
+      </label>
+      <button class="btn btn-sm btn-primary" id="btnAnalyzeStops">Analizza soste</button>
+      <span id="stopsResult" class="stops-result"></span>
+    </div>
+
+    <!-- Tab: Statistiche -->
+    <div class="tab-panel" id="tab-stats" style="display:none">
+      <button class="btn btn-sm btn-primary" id="btnLoadStats">Carica statistiche commute</button>
+    </div>
+  </div>
+
+  <!-- Mappa -->
+  <div id="map"></div>
+
+  <!-- Pannello statistiche globali -->
+  <div class="stats-panel" id="statsPanel" style="display:none">
+    <button class="stats-close" id="statsClose">✕</button>
+    <h2>Statistiche Commute</h2>
+    <div id="statsContent"></div>
+    <canvas id="chartMonthly" height="120"></canvas>
+  </div>
+
+  <!-- Spinner overlay -->
+  <div class="spinner-overlay" id="spinner" style="display:none">
+    <div class="spinner"></div>
+    <div class="spinner-msg" id="spinnerMsg">Caricamento…</div>
+  </div>
+
+</main>
+
+<!-- Scripts -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script>
+// ── Utility ───────────────────────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+
+function fmtTime(secs) {
+  const m = Math.floor(secs / 60), s = Math.round(secs % 60);
+  return `${m}m ${s.toString().padStart(2,'0')}s`;
+}
+
+function showSpinner(msg = 'Caricamento…') {
+  $('spinnerMsg').textContent = msg;
+  $('spinner').style.display = 'flex';
+}
+function hideSpinner() { $('spinner').style.display = 'none'; }
+
+async function apiFetch(url, opts = {}) {
+  const r = await fetch(url, opts);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
+
+// ── Mappa ─────────────────────────────────────────────────────────────────────
+const map = L.map('map', { zoomControl: true });
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  attribution: '© OpenStreetMap contributors',
+  maxZoom: 19
+}).addTo(map);
+
+const routeLayer   = L.layerGroup().addTo(map);
+const markerLayer  = L.layerGroup().addTo(map);
+const pointLayer   = L.layerGroup().addTo(map);
+const heatLayer    = L.layerGroup().addTo(map);
+
+// ── Stato globale ─────────────────────────────────────────────────────────────
+let allActivities  = [];
+let selectedIds    = new Set();
+let activeActivity = null;
+let pointA = null, pointB = null;
+let settingPoint   = null;
+let chartMonthly   = null;
+
+const COLORS = ['#FC4C02', '#3D85C8', '#2ECC71', '#9B59B6', '#F39C12'];
+
+// ── Decode polyline semplice (Google encoded) ─────────────────────────────────
+function decodePolyline(str) {
+  let idx = 0, lat = 0, lon = 0, coords = [];
+  while (idx < str.length) {
+    let b, shift = 0, result = 0;
+    do { b = str.charCodeAt(idx++) - 63; result |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
+    lat += (result & 1) ? ~(result >> 1) : (result >> 1);
+    shift = 0; result = 0;
+    do { b = str.charCodeAt(idx++) - 63; result |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
+    lon += (result & 1) ? ~(result >> 1) : (result >> 1);
+    coords.push([lat / 1e5, lon / 1e5]);
+  }
+  return coords;
+}
+
+// ── Carica attività ────────────────────────────────────────────────────────────
+async function loadActivities(refresh = false) {
+  showSpinner('Recupero attività da Strava…');
+  try {
+    const commute = $('chkCommute').checked;
+    const type    = $('selType').value;
+    let url = `/api/activities?commute=${commute}&refresh=${refresh}`;
+    if (type) url += `&type=${type}`;
+    allActivities = await apiFetch(url);
+    renderList();
+    renderRoutes();
+  } catch(e) {
+    alert('Errore caricamento: ' + e.message);
+  } finally {
+    hideSpinner();
+  }
+}
+
+// ── Renderizza lista sidebar ──────────────────────────────────────────────────
+function renderList() {
+  const list = $('actList');
+  list.innerHTML = '';
+  $('actCount').textContent = `${allActivities.length} attività`;
+
+  if (!allActivities.length) {
+    list.innerHTML = '<div class="empty-msg">Nessuna attività trovata.</div>';
+    return;
+  }
+
+  allActivities.forEach((a, i) => {
+    const date   = new Date(a.start_date);
+    const label  = date.toLocaleDateString('it-IT', {day:'2-digit', month:'short', year:'2-digit'});
+    const mins   = Math.round(a.moving_time / 60);
+    const km     = (a.distance / 1000).toFixed(1);
+    const commBadge = a.commute ? '<span class="badge badge-commute">commute</span>' : '';
+
+    const el = document.createElement('div');
+    el.className = 'act-item';
+    el.dataset.id = a.id;
+    el.innerHTML = `
+      <label class="act-check">
+        <input type="checkbox" class="act-cb" data-id="${a.id}" data-idx="${i}">
+      </label>
+      <div class="act-body">
+        <div class="act-name">${a.name} ${commBadge}</div>
+        <div class="act-meta">
+          <span>${label}</span>
+          <span>${mins} min</span>
+          <span>${km} km</span>
+          <span>${a.avg_speed} km/h</span>
+        </div>
+      </div>
+    `;
+    el.querySelector('.act-cb').addEventListener('change', e => {
+      const id = parseInt(e.target.dataset.id);
+      const idx = parseInt(e.target.dataset.idx);
+      if (e.target.checked) {
+        selectedIds.add(id);
+        highlightRoute(a, COLORS[idx % COLORS.length]);
+      } else {
+        selectedIds.delete(id);
+        renderRoutes();
+      }
+    });
+    el.addEventListener('click', ev => {
+      if (ev.target.type === 'checkbox') return;
+      setActiveActivity(a);
+    });
+    list.appendChild(el);
+  });
+}
+
+// ── Rotte sulla mappa ─────────────────────────────────────────────────────────
+function renderRoutes() {
+  routeLayer.clearLayers();
+  const bounds = [];
+  allActivities.forEach((a, i) => {
+    if (!a.polyline) return;
+    const coords = decodePolyline(a.polyline);
+    if (!coords.length) return;
+    const selected = selectedIds.has(a.id);
+    const poly = L.polyline(coords, {
+      color:   selected ? COLORS[i % COLORS.length] : '#888',
+      weight:  selected ? 4 : 1.5,
+      opacity: selected ? 0.85 : 0.3,
+    }).addTo(routeLayer);
+    poly.on('click', () => setActiveActivity(a));
+    bounds.push(...coords);
+  });
+  if (bounds.length) map.fitBounds(L.latLngBounds(bounds).pad(0.1));
+}
+
+function highlightRoute(a, color) {
+  renderRoutes();
+}
+
+function setActiveActivity(a) {
+  activeActivity = a;
+  document.querySelectorAll('.act-item').forEach(el => el.classList.remove('active'));
+  const el = document.querySelector(`.act-item[data-id="${a.id}"]`);
+  if (el) el.classList.add('active');
+}
+
+// ── Tabs ──────────────────────────────────────────────────────────────────────
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-panel').forEach(p => p.style.display = 'none');
+    btn.classList.add('active');
+    const tab = btn.dataset.tab;
+    const panel = $(`tab-${tab}`);
+    if (panel) panel.style.display = 'flex';
+  });
+});
+
+// ── Selezione punti A/B sulla mappa ──────────────────────────────────────────
+const pinA = L.marker([0,0], { draggable:true,
+  icon: L.divIcon({ className:'pin-a', html:'<div class="pin-icon">A</div>' }) });
+const pinB = L.marker([0,0], { draggable:true,
+  icon: L.divIcon({ className:'pin-b', html:'<div class="pin-icon">B</div>' }) });
+
+$('btnSetA').addEventListener('click', () => {
+  settingPoint = 'A';
+  map.getContainer().style.cursor = 'crosshair';
+  $('btnSetA').classList.add('active');
+});
+$('btnSetB').addEventListener('click', () => {
+  settingPoint = 'B';
+  map.getContainer().style.cursor = 'crosshair';
+  $('btnSetB').classList.add('active');
+});
+
+map.on('click', e => {
+  if (!settingPoint) return;
+  const { lat, lng } = e.latlng;
+  if (settingPoint === 'A') {
+    pointA = [lat, lng];
+    pinA.setLatLng([lat, lng]);
+    if (!map.hasLayer(pinA)) pinA.addTo(pointLayer);
+    $('btnSetA').classList.remove('active');
+  } else {
+    pointB = [lat, lng];
+    pinB.setLatLng([lat, lng]);
+    if (!map.hasLayer(pinB)) pinB.addTo(pointLayer);
+    $('btnSetB').classList.remove('active');
+  }
+  settingPoint = null;
+  map.getContainer().style.cursor = '';
+});
+
+$('btnClearPoints').addEventListener('click', () => {
+  pointA = pointB = null;
+  pointLayer.clearLayers();
+  $('resultsRow').style.display = 'none';
+});
+
+// ── Analisi tempo A→B ─────────────────────────────────────────────────────────
+$('btnAnalyze').addEventListener('click', async () => {
+  if (!pointA || !pointB) { alert('Imposta prima i punti A e B sulla mappa.'); return; }
+  const ids = selectedIds.size > 0 ? [...selectedIds] : allActivities.map(a => a.id);
+  if (!ids.length) { alert('Nessuna attività selezionata.'); return; }
+
+  showSpinner('Analisi percorsi in corso…');
+  try {
+    const body = { point_a: pointA, point_b: pointB, radius: parseInt($('inpRadius').value), activity_ids: ids };
+    const res  = await apiFetch('/api/analyze/time_between_points', {
+      method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
+    });
+    if (res.error) { alert(res.error); return; }
+
+    const s = res.stats;
+    $('resAvg').textContent     = `${s.avg_min} min`;
+    $('resMedian').textContent  = `${s.median_min} min`;
+    $('resMin').textContent     = `${s.min_min} min`;
+    $('resMax').textContent     = `${s.max_min} min`;
+    $('resSamples').textContent = s.count;
+    $('resultsRow').style.display = 'flex';
+
+    // Disegna linea A→B
+    if (map.hasLayer(pinA) && map.hasLayer(pinB)) {
+      heatLayer.clearLayers();
+      L.polyline([pointA, pointB], { color:'#FC4C02', dashArray:'8,6', weight:3 }).addTo(heatLayer);
+    }
+  } catch(e) {
+    alert('Errore analisi: ' + e.message);
+  } finally {
+    hideSpinner();
+  }
+});
+
+// ── Analisi soste ─────────────────────────────────────────────────────────────
+$('btnAnalyzeStops').addEventListener('click', async () => {
+  if (!activeActivity) { alert('Clicca su un\'attività nella lista o sulla mappa prima.'); return; }
+  showSpinner('Analisi soste…');
+  try {
+    const threshold = parseFloat($('inpSpeedThreshold').value) / 3.6; // km/h → m/s
+    const res = await apiFetch('/api/analyze/stops', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ activity_id: activeActivity.id, speed_threshold: threshold, min_duration: 5 })
+    });
+
+    heatLayer.clearLayers();
+
+    // Heatmap velocità: colora la polyline per velocità
+    if (res.speed_profile && res.speed_profile.length > 1) {
+      const speeds = res.speed_profile.map(p => p.speed);
+      const maxSpd = Math.max(...speeds) || 1;
+      for (let i = 0; i < res.speed_profile.length - 1; i++) {
+        const p1 = res.speed_profile[i];
+        const p2 = res.speed_profile[i+1];
+        const ratio = p1.speed / maxSpd;
+        // verde (veloce) → rosso (lento)
+        const r = Math.round(255 * (1 - ratio));
+        const g = Math.round(180 * ratio);
+        const color = `rgb(${r},${g},60)`;
+        L.polyline([[p1.lat,p1.lon],[p2.lat,p2.lon]], { color, weight:4, opacity:0.85 })
+          .bindTooltip(`${p1.speed} km/h`).addTo(heatLayer);
+      }
+    }
+
+    // Marker soste
+    res.stops.forEach(stop => {
+      const dur = stop.duration >= 60
+        ? `${Math.round(stop.duration/60)} min`
+        : `${stop.duration}s`;
+      L.circleMarker([stop.lat, stop.lon], {
+        radius: Math.min(12, 5 + stop.duration / 30),
+        color: '#fff', fillColor: '#e74c3c', fillOpacity: 0.9, weight: 2
+      }).bindPopup(`<b>Sosta</b><br>${dur}`).addTo(heatLayer);
+    });
+
+    const totMin = Math.round(res.total_stop_time / 60);
+    $('stopsResult').textContent =
+      `${res.total_stops} soste · ${totMin} min fermi`;
+
+    // Zoom sull'attività
+    if (activeActivity.polyline) {
+      const coords = decodePolyline(activeActivity.polyline);
+      if (coords.length) map.fitBounds(L.latLngBounds(coords).pad(0.1));
+    }
+  } catch(e) {
+    alert('Errore: ' + e.message);
+  } finally {
+    hideSpinner();
+  }
+});
+
+// ── Statistiche globali ───────────────────────────────────────────────────────
+$('btnLoadStats').addEventListener('click', async () => {
+  showSpinner('Calcolo statistiche…');
+  try {
+    const res = await apiFetch('/api/analyze/commute_stats');
+    const panel = $('statsPanel');
+    const content = $('statsContent');
+
+    let html = '';
+    for (const [type, s] of Object.entries(res.by_type)) {
+      html += `
+        <div class="stat-block">
+          <h3>${type}</h3>
+          <div class="stat-grid">
+            <div><span class="sv">${s.count}</span><span class="sl">Attività</span></div>
+            <div><span class="sv">${s.avg_time_min} min</span><span class="sl">Tempo medio</span></div>
+            <div><span class="sv">${s.avg_dist_km} km</span><span class="sl">Distanza media</span></div>
+            <div><span class="sv">${s.avg_speed_kmh} km/h</span><span class="sl">Velocità media</span></div>
+            <div><span class="sv">${s.total_dist_km} km</span><span class="sl">Totale percorsi</span></div>
+            <div><span class="sv">${s.total_time_h} h</span><span class="sl">Ore totali</span></div>
+          </div>
+        </div>`;
+    }
+    content.innerHTML = html;
+
+    // Grafico mensile
+    const months = Object.keys(res.monthly);
+    const counts = Object.values(res.monthly);
+    if (chartMonthly) chartMonthly.destroy();
+    chartMonthly = new Chart($('chartMonthly'), {
+      type: 'bar',
+      data: {
+        labels: months,
+        datasets: [{ label: 'Commute/mese', data: counts,
+          backgroundColor: '#FC4C02', borderRadius: 4 }]
+      },
+      options: {
+        plugins: { legend: { display: false } },
+        scales: { y: { beginAtZero: true, ticks: { stepSize: 1 } } }
+      }
+    });
+
+    panel.style.display = 'block';
+    $('tab-stats') && ($('statsPanel').scrollIntoView({ behavior:'smooth' }));
+  } catch(e) {
+    alert('Errore statistiche: ' + e.message);
+  } finally {
+    hideSpinner();
+  }
+});
+
+$('statsClose').addEventListener('click', () => { $('statsPanel').style.display = 'none'; });
+
+// ── Seleziona tutto ───────────────────────────────────────────────────────────
+$('chkSelectAll').addEventListener('change', e => {
+  document.querySelectorAll('.act-cb').forEach(cb => {
+    cb.checked = e.target.checked;
+    const id = parseInt(cb.dataset.id);
+    e.target.checked ? selectedIds.add(id) : selectedIds.delete(id);
+  });
+  renderRoutes();
+});
+
+// ── Filtri ────────────────────────────────────────────────────────────────────
+$('chkCommute').addEventListener('change', () => loadActivities());
+$('selType').addEventListener('change',    () => loadActivities());
+$('btnRefresh').addEventListener('click',  () => loadActivities(true));
+
+// ── Pre-caricamento GPS ───────────────────────────────────────────────────────
+let precacheInterval = null;
+
+$('btnPrecache').addEventListener('click', async () => {
+  if ($('btnPrecache').disabled) return;
+  $('btnPrecache').disabled = true;
+  $('btnPrecache').textContent = '…';
+  $('progressWrap').style.display = 'block';
+  $('precacheLog').textContent = '';
+
+  try {
+    const commuteOnly = $('chkCommute').checked;
+    await apiFetch('/api/precache/start', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ commute_only: commuteOnly })
+    });
+
+    // Polling dello stato
+    precacheInterval = setInterval(async () => {
+      const st = await apiFetch('/api/precache/status');
+      const pct = st.total > 0 ? Math.round((st.done / st.total) * 100) : 0;
+      $('progressFill').style.width = pct + '%';
+      $('progressLabel').textContent =
+        `${st.done} / ${st.total} (${pct}%)${st.errors ? ' — ' + st.errors + ' errori' : ''}`;
+      if (st.log && st.log.length)
+        $('precacheLog').textContent = st.log[st.log.length - 1];
+
+      if (!st.running) {
+        clearInterval(precacheInterval);
+        $('btnPrecache').disabled = false;
+        $('btnPrecache').textContent = '✓ Fatto';
+        $('precacheLog').textContent = `✅ ${st.done} attività in cache — analisi ora istantanea!`;
+      }
+    }, 1500);
+  } catch(e) {
+    $('precacheLog').textContent = 'Errore: ' + e.message;
+    $('btnPrecache').disabled = false;
+    $('btnPrecache').textContent = 'Avvia';
+  }
+});
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+// Su Render free plan, dopo una pausa le attività vanno ricaricate da Strava.
+// Carichiamo sempre; se sono in cache locale è istantaneo, altrimenti mostra spinner.
+map.setView([45.07, 7.69], 12);
+loadActivities();
+</script>
+</body>
+</html>

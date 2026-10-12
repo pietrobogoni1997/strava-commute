@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Strava Commute Analyzer</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body class="landing">
+
+  <div class="landing-card">
+    <div class="strava-logo">
+      <svg viewBox="0 0 64 64" width="56" height="56" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="32" cy="32" r="32" fill="#FC4C02"/>
+        <path d="M28 44 L36 28 L44 44 H40 L36 36 L32 44 Z" fill="white"/>
+        <path d="M20 44 L28 28 L32 37 L28 44 H24 L28 36 L24 44 Z" fill="rgba(255,255,255,0.6)"/>
+      </svg>
+    </div>
+    <h1>Strava Commute Analyzer</h1>
+    <p class="subtitle">Analizza i tuoi percorsi casa-lavoro: tempi, velocità, soste e molto altro.</p>
+
+    {% if error %}
+    <div class="alert alert-error">{{ error }}</div>
+    {% endif %}
+
+    {% if not configured %}
+    <div class="alert alert-warn">
+      ⚙️ Configura prima le credenziali Strava nel file <code>.env</code>.<br>
+      Vedi il README per le istruzioni.
+    </div>
+    {% else %}
+    <a href="/login" class="btn btn-strava">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="white">
+        <path d="M15.387 17.944l-2.089-4.116h-3.065L15.387 24l5.15-10.172h-3.066m-7.008-5.599l2.836 5.598h4.172L10.463 0l-7 13.828h4.169"/>
+      </svg>
+      Accedi con Strava
+    </a>
+    {% endif %}
+
+    <div class="features">
+      <div class="feature">
+        <span class="feat-icon">⏱</span>
+        <span>Tempo medio A→B</span>
+      </div>
+      <div class="feature">
+        <span class="feat-icon">🗺</span>
+        <span>Heatmap velocità</span>
+      </div>
+      <div class="feature">
+        <span class="feat-icon">🛑</span>
+        <span>Rilevamento soste</span>
+      </div>
+      <div class="feature">
+        <span class="feat-icon">📊</span>
+        <span>Statistiche nel tempo</span>
+      </div>
+    </div>
+  </div>
+
+</body>
+</html>

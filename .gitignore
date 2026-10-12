@@ -1,0 +1,17 @@
+# Credenziali — non caricare mai su GitHub!
+.env
+
+# Cache locale attività
+activities_cache.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+venv/
+.venv/
+
+# Sistema
+.DS_Store
+Thumbs.db
