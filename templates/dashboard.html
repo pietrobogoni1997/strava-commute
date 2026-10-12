@@ -147,6 +147,7 @@
 <!-- Scripts -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+{% raw %}
 <script>
 // ── Utility ───────────────────────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
@@ -265,7 +266,7 @@ function renderList() {
         selectedIds.add(id);
         highlightRoute(a, COLORS[idx % COLORS.length]);
         setActiveActivity(a); // ← fix: aggiorna activeActivity anche da checkbox
-      } else {{
+      } else {
         selectedIds.delete(id);
         renderRoutes();
       }
@@ -574,5 +575,6 @@ $('btnPrecache').addEventListener('click', async () => {
 map.setView([45.07, 7.69], 12);
 loadActivities();
 </script>
+{% endraw %}
 </body>
 </html>
