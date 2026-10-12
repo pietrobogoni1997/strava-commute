@@ -264,7 +264,8 @@ function renderList() {
       if (e.target.checked) {
         selectedIds.add(id);
         highlightRoute(a, COLORS[idx % COLORS.length]);
-      } else {
+        setActiveActivity(a); // ← fix: aggiorna activeActivity anche da checkbox
+      } else {{
         selectedIds.delete(id);
         renderRoutes();
       }
@@ -306,6 +307,11 @@ function setActiveActivity(a) {
   document.querySelectorAll('.act-item').forEach(el => el.classList.remove('active'));
   const el = document.querySelector(`.act-item[data-id="${a.id}"]`);
   if (el) el.classList.add('active');
+  // Mostra il nome dell'attività attiva nell'hint del tab Soste
+  const date = new Date(a.start_date);
+  const label = date.toLocaleDateString('it-IT', {day:'2-digit', month:'short', year:'2-digit'});
+  const hint = document.querySelector('#tab-stops .hint');
+  if (hint) hint.textContent = `▶ ${a.name} (${label}) — clicca "Analizza soste"`;
 }
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
