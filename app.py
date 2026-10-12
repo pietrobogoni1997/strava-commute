@@ -28,16 +28,85 @@ STRAVA_TOKEN_URL = 'https://www.strava.com/oauth/token'
 STRAVA_API      = 'https://www.strava.com/api/v3'
 CACHE_FILE = os.path.join(os.path.dirname(__file__), 'activities_cache.json')
 
+# Supabase (opzionale — se configurato, la cache persiste tra i riavvii)
+SUPABASE_URL = os.environ.get('SUPABASE_URL', '')
+SUPABASE_KEY = os.environ.get('SUPABASE_KEY', '')
+
 
 # ─── Cache helpers ────────────────────────────────────────────────────────────
+# Se SUPABASE_URL è configurato usa il database cloud (cache persistente).
+# Altrimenti usa il file locale (cache persa a ogni riavvio su Render free).
+#
+# In-memory layer: evita di rileggere il DB a ogni richiesta dentro la stessa
+# sessione del worker. Gunicorn con 2 worker = 2 processi indipendenti, ma
+# entrambi caricano da Supabase all'avvio → comportamento corretto.
 
-def load_cache():
+_mem_cache: dict | None = None
+_mem_cache_keys: set   = set()
+
+def _sb_headers():
+    return {
+        'apikey':        SUPABASE_KEY,
+        'Authorization': f'Bearer {SUPABASE_KEY}',
+        'Content-Type':  'application/json',
+    }
+
+def load_cache() -> dict:
+    global _mem_cache, _mem_cache_keys
+    if _mem_cache is not None:
+        return _mem_cache
+
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            r = requests.get(
+                f'{SUPABASE_URL}/rest/v1/cache_store?select=key,value',
+                headers=_sb_headers(), timeout=15
+            )
+            if r.ok:
+                rows = r.json()
+                _mem_cache = {row['key']: row['value'] for row in rows}
+                _mem_cache_keys = set(_mem_cache.keys())
+                print(f'[cache] Caricato da Supabase: {len(_mem_cache)} entry')
+                return _mem_cache
+        except Exception as e:
+            print(f'[cache] Supabase load error: {e}')
+
+    # Fallback file locale
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, 'r') as f:
-            return json.load(f)
-    return {}
+        with open(CACHE_FILE) as f:
+            _mem_cache = json.load(f)
+    else:
+        _mem_cache = {}
+    _mem_cache_keys = set(_mem_cache.keys())
+    return _mem_cache
 
-def save_cache(data):
+def save_cache(data: dict):
+    """Salva la cache. Su Supabase fa upsert solo delle chiavi nuove (efficiente)."""
+    global _mem_cache, _mem_cache_keys
+
+    if SUPABASE_URL and SUPABASE_KEY:
+        # Upsert solo le chiavi che non erano ancora in Supabase
+        new_keys = [k for k in data if k not in _mem_cache_keys]
+        if new_keys:
+            rows = [{'key': k, 'value': data[k]} for k in new_keys]
+            try:
+                for i in range(0, len(rows), 50):          # batch da 50
+                    requests.post(
+                        f'{SUPABASE_URL}/rest/v1/cache_store',
+                        headers={**_sb_headers(),
+                                 'Prefer': 'resolution=merge-duplicates,return=minimal'},
+                        json=rows[i:i + 50],
+                        timeout=30
+                    )
+                _mem_cache_keys.update(new_keys)
+                print(f'[cache] Salvato su Supabase: {len(new_keys)} nuove entry')
+            except Exception as e:
+                print(f'[cache] Supabase save error: {e}')
+        _mem_cache = data
+        return
+
+    # Fallback file locale
+    _mem_cache = data
     with open(CACHE_FILE, 'w') as f:
         json.dump(data, f)
 
@@ -215,29 +284,82 @@ def api_stream(aid):
     return jsonify(cache[key])
 
 
+# ─── Helpers: soste e clustering ──────────────────────────────────────────────
+
+def _find_stops_in_segment(coords, times, vels, threshold=0.5, min_dur=10):
+    """Trova soste in un segmento GPS (threshold in m/s, min_dur in secondi)."""
+    stops = []
+    in_stop = False
+    stop_start = stop_lat = stop_lon = None
+    for pos, t, v in zip(coords, times, vels):
+        if v < threshold:
+            if not in_stop:
+                in_stop, stop_start, stop_lat, stop_lon = True, t, pos[0], pos[1]
+        else:
+            if in_stop:
+                dur = t - stop_start
+                if dur >= min_dur:
+                    stops.append({'lat': stop_lat, 'lon': stop_lon, 'duration': int(dur)})
+                in_stop = False
+    return stops
+
+
+def _cluster_stops(stops, cluster_radius=60):
+    """Raggruppa soste vicine in cluster, restituisce centro e statistiche."""
+    if not stops:
+        return []
+    used = [False] * len(stops)
+    clusters = []
+    for i, s in enumerate(stops):
+        if used[i]:
+            continue
+        group = [s]
+        used[i] = True
+        for j, other in enumerate(stops):
+            if not used[j] and haversine(s['lat'], s['lon'], other['lat'], other['lon']) < cluster_radius:
+                group.append(other)
+                used[j] = True
+        clusters.append({
+            'lat':          round(statistics.mean(c['lat'] for c in group), 6),
+            'lon':          round(statistics.mean(c['lon'] for c in group), 6),
+            'count':        len(group),
+            'avg_duration': round(statistics.mean(c['duration'] for c in group)),
+        })
+    return clusters
+
+
 # ─── API: tempo tra due punti ─────────────────────────────────────────────────
+
+MAX_LIVE_FETCH = 12  # max stream fetch real-time per non andare in timeout
 
 @app.route('/api/analyze/time_between_points', methods=['POST'])
 @login_required
 def api_time_between_points():
-    body         = request.json
-    point_a      = body.get('point_a')       # [lat, lon]
-    point_b      = body.get('point_b')       # [lat, lon]
-    radius       = body.get('radius', 50)    # metri
-    activity_ids = body.get('activity_ids', [])
+    body             = request.json
+    point_a          = body.get('point_a')
+    point_b          = body.get('point_b')
+    radius           = body.get('radius', 50)
+    activity_ids     = body.get('activity_ids', [])
+    speed_threshold  = 0.5   # m/s ≈ 1.8 km/h
+    min_stop_dur     = 10    # secondi
 
-    cache   = load_cache()
-    results = []
+    cache    = load_cache()
+    results  = []
+    segments = []          # sub-segmenti A→B con speed profile
+    fetched  = 0           # contatore fetch live
 
     for aid in activity_ids:
         key = f'stream_{aid}'
         if key not in cache:
+            if fetched >= MAX_LIVE_FETCH:
+                continue   # troppi da scaricare: salta, suggerisci pre-cache
             try:
                 data = strava(
                     f'activities/{aid}/streams',
-                    {'keys': 'latlng,time', 'key_by_type': 'true'}
+                    {'keys': 'latlng,time,velocity_smooth', 'key_by_type': 'true'}
                 )
                 cache[key] = data
+                fetched += 1
             except:
                 continue
 
@@ -247,37 +369,75 @@ def api_time_between_points():
 
         coords = s['latlng']['data']
         times  = s['time']['data']
+        vels   = s.get('velocity_smooth', {}).get('data', [0.0] * len(times))
 
-        time_a = time_b = None
-        for pos, t in zip(coords, times):
-            if time_a is None and haversine(pos[0], pos[1], point_a[0], point_a[1]) < radius:
-                time_a = t
-            if time_a is not None and time_b is None and \
+        idx_a = idx_b = None
+        for i, (pos, t) in enumerate(zip(coords, times)):
+            if idx_a is None and haversine(pos[0], pos[1], point_a[0], point_a[1]) < radius:
+                idx_a = i
+            if idx_a is not None and idx_b is None and \
                haversine(pos[0], pos[1], point_b[0], point_b[1]) < radius:
-                time_b = t
+                idx_b = i
                 break
 
-        if time_a is not None and time_b is not None and time_b > time_a:
-            secs = time_b - time_a
-            results.append({'activity_id': aid, 'seconds': secs,
-                            'minutes': round(secs / 60, 1)})
+        if idx_a is None or idx_b is None or times[idx_b] <= times[idx_a]:
+            continue
+
+        secs = times[idx_b] - times[idx_a]
+        results.append({'activity_id': aid, 'seconds': secs, 'minutes': round(secs / 60, 1)})
+        segments.append({
+            'activity_id': aid,
+            'seconds':     secs,
+            'coords':      coords[idx_a:idx_b + 1],
+            'vels':        vels[idx_a:idx_b + 1],
+            'times':       times[idx_a:idx_b + 1],
+        })
 
     save_cache(cache)
 
     if not results:
-        return jsonify({'error': 'Nessuna attività attraversa entrambi i punti.', 'results': []})
+        msg = 'Nessuna attività attraversa entrambi i punti.'
+        if fetched == 0 and any(f'stream_{i}' not in cache for i in activity_ids):
+            msg += ' Usa "Pre-carica GPS" nella sidebar per scaricare gli stream prima.'
+        return jsonify({'error': msg, 'results': []})
 
     secs_list = [r['seconds'] for r in results]
+
+    # Percorso rappresentativo = attività con tempo più vicino alla mediana
+    median_secs = statistics.median(secs_list)
+    rep = min(segments, key=lambda sg: abs(sg['seconds'] - median_secs))
+
+    speed_profile = [
+        {'lat': c[0], 'lon': c[1], 'speed': round(v * 3.6, 1)}
+        for c, v in zip(rep['coords'], rep['vels'])
+    ]
+
+    # Soste ricorrenti: trova in ogni segmento, poi raggruppa e filtra per frequenza
+    all_stops = []
+    for sg in segments:
+        all_stops.extend(_find_stops_in_segment(sg['coords'], sg['times'], sg['vels'],
+                                                speed_threshold, min_stop_dur))
+    clustered   = _cluster_stops(all_stops, cluster_radius=60)
+    min_count   = max(1, len(segments) // 4)   # almeno nel 25% delle attività
+    freq_stops  = [st for st in clustered if st['count'] >= min_count]
+
+    skipped = len(activity_ids) - len(results) - (len(activity_ids) - len([i for i in activity_ids if f'stream_{i}' in cache]) - fetched)
+
     return jsonify({
         'results': sorted(results, key=lambda x: x['seconds']),
         'stats': {
-            'count':       len(secs_list),
-            'avg_min':     round(statistics.mean(secs_list) / 60, 1),
-            'median_min':  round(statistics.median(secs_list) / 60, 1),
-            'min_min':     round(min(secs_list) / 60, 1),
-            'max_min':     round(max(secs_list) / 60, 1),
-            'stdev_sec':   round(statistics.stdev(secs_list), 0) if len(secs_list) > 1 else 0,
-        }
+            'count':      len(secs_list),
+            'avg_min':    round(statistics.mean(secs_list) / 60, 1),
+            'median_min': round(statistics.median(secs_list) / 60, 1),
+            'min_min':    round(min(secs_list) / 60, 1),
+            'max_min':    round(max(secs_list) / 60, 1),
+            'stdev_sec':  round(statistics.stdev(secs_list), 0) if len(secs_list) > 1 else 0,
+        },
+        'heatmap': {
+            'speed_profile': speed_profile,
+            'stops':         freq_stops,
+        },
+        'note': f'{fetched} stream scaricati ora; usa Pre-carica GPS per analisi più completa.' if fetched > 0 else '',
     })
 
 
