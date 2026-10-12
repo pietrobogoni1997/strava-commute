@@ -328,6 +328,57 @@ def _cluster_stops(stops, cluster_radius=60):
     return clusters
 
 
+def _compute_avg_speed_profile(segments, ref_idx, n_bins=80):
+    """
+    Crea profilo di velocità media combinando tutti i segmenti.
+    Usa il segmento di riferimento come scheletro spaziale.
+    Divide la tratta in n_bins slot di distanza e media le velocità
+    di tutti i segmenti in ciascuno slot.
+    """
+    ref = segments[ref_idx]
+    ref_coords = ref['coords']
+
+    # Distanze cumulative del percorso di riferimento
+    cum_ref = [0.0]
+    for i in range(1, len(ref_coords)):
+        d = haversine(ref_coords[i-1][0], ref_coords[i-1][1],
+                      ref_coords[i][0], ref_coords[i][1])
+        cum_ref.append(cum_ref[-1] + d)
+    total_ref = cum_ref[-1] or 1.0
+
+    # Accumula velocità per bin da ogni segmento
+    bin_speeds = [[] for _ in range(n_bins)]
+    for sg in segments:
+        sg_coords = sg['coords']
+        sg_vels   = sg['vels']
+        # Distanze cumulative del segmento corrente
+        cum_sg = [0.0]
+        for i in range(1, len(sg_coords)):
+            d = haversine(sg_coords[i-1][0], sg_coords[i-1][1],
+                          sg_coords[i][0], sg_coords[i][1])
+            cum_sg.append(cum_sg[-1] + d)
+        total_sg = cum_sg[-1] or 1.0
+        # Assegna ogni punto GPS al bin proporzionale
+        for v, dist in zip(sg_vels, cum_sg):
+            rel = dist / total_sg
+            b   = min(int(rel * n_bins), n_bins - 1)
+            bin_speeds[b].append(v * 3.6)
+
+    # Costruisce il profilo usando le coordinate di riferimento
+    profile = []
+    for i, coord in enumerate(ref_coords):
+        rel = cum_ref[i] / total_ref
+        b   = min(int(rel * n_bins), n_bins - 1)
+        speeds = bin_speeds[b]
+        profile.append({
+            'lat':   round(coord[0], 6),
+            'lon':   round(coord[1], 6),
+            'speed': round(statistics.mean(speeds), 1) if speeds else 0.0,
+            'count': len(speeds),
+        })
+    return profile
+
+
 # ─── API: tempo tra due punti ─────────────────────────────────────────────────
 
 MAX_LIVE_FETCH = 12  # max stream fetch real-time per non andare in timeout
@@ -405,12 +456,10 @@ def api_time_between_points():
 
     # Percorso rappresentativo = attività con tempo più vicino alla mediana
     median_secs = statistics.median(secs_list)
-    rep = min(segments, key=lambda sg: abs(sg['seconds'] - median_secs))
+    ref_idx = min(range(len(segments)), key=lambda i: abs(segments[i]['seconds'] - median_secs))
 
-    speed_profile = [
-        {'lat': c[0], 'lon': c[1], 'speed': round(v * 3.6, 1)}
-        for c, v in zip(rep['coords'], rep['vels'])
-    ]
+    # Profilo velocità media combinando TUTTI i segmenti
+    speed_profile = _compute_avg_speed_profile(segments, ref_idx)
 
     # Soste ricorrenti: trova in ogni segmento, poi raggruppa e filtra per frequenza
     all_stops = []

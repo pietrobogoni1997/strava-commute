@@ -390,10 +390,78 @@ $('btnAnalyze').addEventListener('click', async () => {
     $('resSamples').textContent = s.count;
     $('resultsRow').style.display = 'flex';
 
-    // Disegna linea A→B
-    if (map.hasLayer(pinA) && map.hasLayer(pinB)) {
-      heatLayer.clearLayers();
-      L.polyline([pointA, pointB], { color:'#FC4C02', dashArray:'8,6', weight:3 }).addTo(heatLayer);
+    // Heatmap velocità sul percorso A→B (media di TUTTE le tracce)
+    if (heatLayer._legend) { heatLayer._legend.remove(); heatLayer._legend = null; }
+    heatLayer.clearLayers();
+
+    if (res.heatmap && res.heatmap.speed_profile && res.heatmap.speed_profile.length > 1) {
+      const profile = res.heatmap.speed_profile;
+      const speeds  = profile.map(p => p.speed).filter(v => v > 0);
+      const maxSpd  = Math.max(...speeds) || 1;
+      const minSpd  = Math.min(...speeds) || 0;
+      const range   = maxSpd - minSpd || 1;
+
+      for (let i = 0; i < profile.length - 1; i++) {
+        const p1 = profile[i], p2 = profile[i + 1];
+        const ratio = (p1.speed - minSpd) / range;   // 0=lento, 1=veloce
+        const r = Math.round(220 * (1 - ratio));
+        const g = Math.round(180 * ratio);
+        const nTracks = p1.count || 1;
+        L.polyline([[p1.lat, p1.lon], [p2.lat, p2.lon]], {
+          color: `rgb(${r},${g},40)`, weight: 6, opacity: 0.85
+        }).bindTooltip(`⌀ ${p1.speed} km/h · ${nTracks} tracce`, {sticky: true})
+          .addTo(heatLayer);
+      }
+
+      // Legenda colori
+      const legend = L.control({ position: 'bottomright' });
+      legend.onAdd = () => {
+        const div = L.DomUtil.create('div');
+        div.style.cssText = 'background:rgba(30,30,30,.85);color:#eee;padding:8px 12px;border-radius:8px;font-size:12px;line-height:1.6';
+        div.innerHTML = `<b>Velocità media</b><br>
+          <span style="color:rgb(0,180,40)">■</span> veloce (${Math.round(maxSpd)} km/h)<br>
+          <span style="color:rgb(220,90,40)">■</span> lento (${Math.round(minSpd)} km/h)`;
+        return div;
+      };
+      legend.addTo(map);
+      heatLayer._legend = legend;
+    }
+
+    // Soste ricorrenti lungo il percorso
+    if (res.heatmap && res.heatmap.stops) {
+      res.heatmap.stops.forEach(stop => {
+        const pct  = Math.round((stop.count / s.count) * 100);
+        const dur  = stop.avg_duration >= 60
+          ? `${Math.round(stop.avg_duration / 60)} min`
+          : `${stop.avg_duration}s`;
+        L.circleMarker([stop.lat, stop.lon], {
+          radius: Math.min(14, 6 + stop.count * 1.5),
+          color: '#fff', fillColor: '#e74c3c', fillOpacity: 0.85, weight: 2
+        }).bindPopup(`<b>Sosta ricorrente</b><br>${pct}% delle attività<br>Durata media: ${dur}`)
+          .addTo(heatLayer);
+      });
+    }
+
+    // Marcatori A e B con sfondo arancione
+    L.circleMarker(pointA, { radius:10, color:'#fff', fillColor:'#FC4C02', fillOpacity:1, weight:2 })
+      .bindTooltip('A').addTo(heatLayer);
+    L.circleMarker(pointB, { radius:10, color:'#fff', fillColor:'#FC4C02', fillOpacity:1, weight:2 })
+      .bindTooltip('B').addTo(heatLayer);
+
+    // Zoom sul percorso
+    if (res.heatmap && res.heatmap.speed_profile && res.heatmap.speed_profile.length) {
+      const pts = res.heatmap.speed_profile.map(p => [p.lat, p.lon]);
+      map.fitBounds(L.latLngBounds(pts).pad(0.15));
+    }
+
+    // Nota visibile se stream scaricati live
+    if (res.note) {
+      const nb = document.createElement('div');
+      nb.style.cssText = 'background:#856404;color:#fff3cd;padding:6px 10px;border-radius:6px;font-size:.82rem;margin-top:8px';
+      nb.textContent = '⚠ ' + res.note;
+      const rr = $('resultsRow');
+      rr.parentNode.insertBefore(nb, rr.nextSibling);
+      setTimeout(() => nb.remove(), 12000);
     }
   } catch(e) {
     alert('Errore analisi: ' + e.message);
@@ -413,6 +481,7 @@ $('btnAnalyzeStops').addEventListener('click', async () => {
       body: JSON.stringify({ activity_id: activeActivity.id, speed_threshold: threshold, min_duration: 5 })
     });
 
+    if (heatLayer._legend) { heatLayer._legend.remove(); heatLayer._legend = null; }
     heatLayer.clearLayers();
 
     // Heatmap velocità: colora la polyline per velocità
