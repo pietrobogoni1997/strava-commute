@@ -47,6 +47,7 @@
     <div class="precache-header">
       <span>⚡ Pre-carica GPS</span>
       <button class="btn btn-sm btn-primary" id="btnPrecache">Avvia</button>
+      <button class="btn btn-sm btn-danger" id="btnPrecacheStop" style="display:none;margin-left:4px" title="Ferma e ricomincia">✕</button>
     </div>
     <div class="precache-sub">Scarica tutti gli stream GPS ora → analisi istantanea</div>
     <div class="progress-wrap" id="progressWrap" style="display:none">
@@ -599,23 +600,15 @@ $('btnRefresh').addEventListener('click',  () => loadActivities(true));
 // ── Pre-caricamento GPS ───────────────────────────────────────────────────────
 let precacheInterval = null;
 
-$('btnPrecache').addEventListener('click', async () => {
-  if ($('btnPrecache').disabled) return;
+function startPrecachePolling() {
+  if (precacheInterval) clearInterval(precacheInterval);
   $('btnPrecache').disabled = true;
   $('btnPrecache').textContent = '…';
+  $('btnPrecacheStop').style.display = 'inline-block';
   $('progressWrap').style.display = 'block';
-  $('precacheLog').textContent = '';
 
-  try {
-    const commuteOnly = $('chkCommute').checked;
-    await apiFetch('/api/precache/start', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ commute_only: commuteOnly })
-    });
-
-    // Polling dello stato
-    precacheInterval = setInterval(async () => {
+  precacheInterval = setInterval(async () => {
+    try {
       const st = await apiFetch('/api/precache/status');
       const pct = st.total > 0 ? Math.round((st.done / st.total) * 100) : 0;
       $('progressFill').style.width = pct + '%';
@@ -628,14 +621,51 @@ $('btnPrecache').addEventListener('click', async () => {
         clearInterval(precacheInterval);
         $('btnPrecache').disabled = false;
         $('btnPrecache').textContent = '✓ Fatto';
+        $('btnPrecacheStop').style.display = 'none';
         $('precacheLog').textContent = `✅ ${st.done} attività in cache — analisi ora istantanea!`;
       }
-    }, 1500);
+    } catch(e) { /* ignora errori di polling */ }
+  }, 1500);
+}
+
+$('btnPrecache').addEventListener('click', async () => {
+  if ($('btnPrecache').disabled) return;
+  $('precacheLog').textContent = '';
+
+  try {
+    const commuteOnly = $('chkCommute').checked;
+    const r = await fetch('/api/precache/start', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ commute_only: commuteOnly })
+    });
+    const data = await r.json();
+
+    if (r.status === 409 && data.already_running) {
+      // Thread già in corso: mostra il progresso corrente e riprendi il polling
+      $('precacheLog').textContent = '▶ Pre-cache già in corso, riprendo monitoraggio…';
+      startPrecachePolling();
+      return;
+    }
+    if (!r.ok) {
+      $('precacheLog').textContent = 'Errore: ' + (data.error || `HTTP ${r.status}`);
+      return;
+    }
+    startPrecachePolling();
   } catch(e) {
     $('precacheLog').textContent = 'Errore: ' + e.message;
+  }
+});
+
+$('btnPrecacheStop').addEventListener('click', async () => {
+  try {
+    await fetch('/api/precache/stop', { method: 'POST' });
+    clearInterval(precacheInterval);
     $('btnPrecache').disabled = false;
     $('btnPrecache').textContent = 'Avvia';
-  }
+    $('btnPrecacheStop').style.display = 'none';
+    $('precacheLog').textContent = '⛔ Fermato. Clicca Avvia per ricominciare.';
+  } catch(e) { /* ignora */ }
 });
 
 // ── Init ──────────────────────────────────────────────────────────────────────

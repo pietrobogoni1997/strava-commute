@@ -677,7 +677,8 @@ def api_commute_stats():
 import threading
 import time as time_mod
 
-_precache_state = {'running': False, 'done': 0, 'total': 0, 'errors': 0, 'log': []}
+_precache_state  = {'running': False, 'done': 0, 'total': 0, 'errors': 0, 'log': []}
+_precache_thread = None   # riferimento al thread corrente
 
 def _precache_worker(activity_ids, token):
     global _precache_state
@@ -726,19 +727,49 @@ def _precache_worker(activity_ids, token):
     _precache_state['log'].append('✅ Pre-caricamento completato!')
 
 
+@app.route('/api/precache/stop', methods=['POST'])
+@login_required
+def api_precache_stop():
+    """Forza il reset del pre-cache (utile se il thread è bloccato)."""
+    global _precache_state, _precache_thread
+    _precache_state['running'] = False
+    _precache_state['log'].append('⛔ Interrotto manualmente.')
+    # Il thread daemon terminerà da solo alla prossima iterazione o al riavvio
+    return jsonify({'stopped': True})
+
+
 @app.route('/api/precache/start', methods=['POST'])
 @login_required
 def api_precache_start():
-    global _precache_state
+    global _precache_state, _precache_thread
+
+    # Se il thread è marcato "running" ma è effettivamente morto → reset automatico
     if _precache_state['running']:
-        return jsonify({'error': 'Pre-caricamento già in corso.'}), 409
+        if _precache_thread is not None and not _precache_thread.is_alive():
+            _precache_state['running'] = False
+            _precache_state['log'].append('⚠️ Thread precedente terminato inaspettatamente, riavvio…')
+        else:
+            # Thread vivo: restituiamo lo stato corrente con 409 (il frontend riprende il polling)
+            return jsonify({**_precache_state, 'already_running': True}), 409
 
     athlete_id = str(session['athlete'].get('id', 'unknown'))
     key        = f'activities_{athlete_id}'
 
     data = cache_get(key)
     if not data:
-        return jsonify({'error': 'Carica prima la lista attività (premi Aggiorna).'}), 400
+        # Prova a caricare le attività on-the-fly
+        try:
+            activities, page = [], 1
+            while True:
+                batch = strava('athlete/activities', {'per_page': 200, 'page': page})
+                if not batch: break
+                activities.extend(batch)
+                if len(batch) < 200: break
+                page += 1
+            data = {'activities': activities, 'fetched_at': datetime.now().isoformat()}
+            cache_set(key, data)
+        except Exception as e:
+            return jsonify({'error': f'Impossibile caricare attività: {e}'}), 400
 
     commute_only = request.json.get('commute_only', True)
     acts = data['activities']
@@ -753,8 +784,8 @@ def api_precache_start():
     cached = sum(1 for i in ids if cache_has(f'stream_{i}'))
 
     token = session['access_token']
-    t = threading.Thread(target=_precache_worker, args=(ids, token), daemon=True)
-    t.start()
+    _precache_thread = threading.Thread(target=_precache_worker, args=(ids, token), daemon=True)
+    _precache_thread.start()
 
     return jsonify({'started': True, 'total': len(ids), 'already_cached': cached})
 
