@@ -33,16 +33,20 @@ SUPABASE_URL = os.environ.get('SUPABASE_URL', '')
 SUPABASE_KEY = os.environ.get('SUPABASE_KEY', '')
 
 
-# ─── Cache helpers ────────────────────────────────────────────────────────────
-# Se SUPABASE_URL è configurato usa il database cloud (cache persistente).
-# Altrimenti usa il file locale (cache persa a ogni riavvio su Render free).
+# ─── Cache layer (lazy) ───────────────────────────────────────────────────────
+# Architettura:
+#   1. All'avvio carica solo le CHIAVI (indice leggero, niente payload)
+#   2. I valori vengono caricati on-demand da Supabase, uno per uno o in batch
+#   3. In-memory layer per ogni worker Gunicorn (evita richieste ripetute)
 #
-# In-memory layer: evita di rileggere il DB a ogni richiesta dentro la stessa
-# sessione del worker. Gunicorn con 2 worker = 2 processi indipendenti, ma
-# entrambi caricano da Supabase all'avvio → comportamento corretto.
+# Questo risolve:
+#   - Limite 1000 righe del REST API Supabase (usiamo select=key con limit=200000)
+#   - Timeout per caricamento di 20MB+ di JSONB all'avvio
+#   - Attività sempre recuperate da Strava (chiave non trovata nei primi 1000)
 
-_mem_cache: dict | None = None
-_mem_cache_keys: set   = set()
+_mem_cache:   dict = {}    # key → valore (caricato on-demand)
+_sb_known:    set  = set() # chiavi note in Supabase (solo indice, senza valori)
+_cache_ready: bool = False
 
 def _sb_headers():
     return {
@@ -51,64 +55,117 @@ def _sb_headers():
         'Content-Type':  'application/json',
     }
 
-def load_cache() -> dict:
-    global _mem_cache, _mem_cache_keys
-    if _mem_cache is not None:
-        return _mem_cache
-
+def _ensure_index():
+    """Carica l'indice delle chiavi da Supabase (una volta per worker)."""
+    global _sb_known, _cache_ready
+    if _cache_ready:
+        return
+    _cache_ready = True
     if SUPABASE_URL and SUPABASE_KEY:
         try:
             r = requests.get(
-                f'{SUPABASE_URL}/rest/v1/cache_store?select=key,value',
+                f'{SUPABASE_URL}/rest/v1/cache_store?select=key&limit=200000',
+                headers=_sb_headers(), timeout=20
+            )
+            if r.ok:
+                _sb_known.update(row['key'] for row in r.json())
+                print(f'[cache] Index caricato: {len(_sb_known)} chiavi in Supabase')
+            else:
+                print(f'[cache] Index error: {r.status_code} {r.text[:200]}')
+        except Exception as e:
+            print(f'[cache] _ensure_index error: {e}')
+    else:
+        # Fallback file locale
+        if os.path.exists(CACHE_FILE):
+            try:
+                with open(CACHE_FILE) as f:
+                    _mem_cache.update(json.load(f))
+                _sb_known.update(_mem_cache.keys())
+            except Exception:
+                pass
+
+def cache_has(key: str) -> bool:
+    """True se la chiave esiste (in memoria o in Supabase)."""
+    _ensure_index()
+    return key in _mem_cache or key in _sb_known
+
+def cache_get(key: str):
+    """Restituisce il valore, caricandolo da Supabase se non è in memoria."""
+    _ensure_index()
+    if key in _mem_cache:
+        return _mem_cache[key]
+    if key not in _sb_known:
+        return None
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            r = requests.get(
+                f'{SUPABASE_URL}/rest/v1/cache_store?key=eq.{key}&select=value&limit=1',
                 headers=_sb_headers(), timeout=15
             )
             if r.ok:
                 rows = r.json()
-                _mem_cache = {row['key']: row['value'] for row in rows}
-                _mem_cache_keys = set(_mem_cache.keys())
-                print(f'[cache] Caricato da Supabase: {len(_mem_cache)} entry')
-                return _mem_cache
+                if rows:
+                    val = rows[0]['value']
+                    _mem_cache[key] = val
+                    return val
         except Exception as e:
-            print(f'[cache] Supabase load error: {e}')
+            print(f'[cache] get({key}) error: {e}')
+    return None
 
-    # Fallback file locale
-    if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE) as f:
-            _mem_cache = json.load(f)
-    else:
-        _mem_cache = {}
-    _mem_cache_keys = set(_mem_cache.keys())
-    return _mem_cache
+def cache_get_many(keys: list) -> dict:
+    """Carica più chiavi in batch da Supabase (riduce le richieste HTTP)."""
+    _ensure_index()
+    result = {}
+    missing = []
+    for k in keys:
+        if k in _mem_cache:
+            result[k] = _mem_cache[k]
+        elif k in _sb_known:
+            missing.append(k)
 
-def save_cache(data: dict):
-    """Salva la cache. Su Supabase fa upsert solo delle chiavi nuove (efficiente)."""
-    global _mem_cache, _mem_cache_keys
-
-    if SUPABASE_URL and SUPABASE_KEY:
-        # Upsert solo le chiavi che non erano ancora in Supabase
-        new_keys = [k for k in data if k not in _mem_cache_keys]
-        if new_keys:
-            rows = [{'key': k, 'value': data[k]} for k in new_keys]
+    if missing and SUPABASE_URL and SUPABASE_KEY:
+        for i in range(0, len(missing), 50):
+            batch = missing[i:i + 50]
+            keys_param = ','.join(batch)
             try:
-                for i in range(0, len(rows), 50):          # batch da 50
-                    requests.post(
-                        f'{SUPABASE_URL}/rest/v1/cache_store',
-                        headers={**_sb_headers(),
-                                 'Prefer': 'resolution=merge-duplicates,return=minimal'},
-                        json=rows[i:i + 50],
-                        timeout=30
-                    )
-                _mem_cache_keys.update(new_keys)
-                print(f'[cache] Salvato su Supabase: {len(new_keys)} nuove entry')
+                r = requests.get(
+                    f'{SUPABASE_URL}/rest/v1/cache_store?key=in.({keys_param})&select=key,value&limit=100',
+                    headers=_sb_headers(), timeout=30
+                )
+                if r.ok:
+                    for row in r.json():
+                        _mem_cache[row['key']] = row['value']
+                        result[row['key']] = row['value']
             except Exception as e:
-                print(f'[cache] Supabase save error: {e}')
-        _mem_cache = data
-        return
+                print(f'[cache] get_many batch error: {e}')
+    return result
 
-    # Fallback file locale
-    _mem_cache = data
-    with open(CACHE_FILE, 'w') as f:
-        json.dump(data, f)
+def cache_set(key: str, value) -> bool:
+    """Salva in memoria + Supabase (upsert) o file locale."""
+    global _sb_known
+    _ensure_index()
+    _mem_cache[key] = value
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            requests.post(
+                f'{SUPABASE_URL}/rest/v1/cache_store',
+                headers={**_sb_headers(),
+                         'Prefer': 'resolution=merge-duplicates,return=minimal'},
+                json={'key': key, 'value': value},
+                timeout=30
+            )
+            _sb_known.add(key)
+            return True
+        except Exception as e:
+            print(f'[cache] set({key}) error: {e}')
+            return False
+    else:
+        try:
+            with open(CACHE_FILE, 'w') as f:
+                json.dump(_mem_cache, f)
+        except Exception:
+            pass
+        return True
 
 
 # ─── Auth helpers ─────────────────────────────────────────────────────────────
@@ -215,12 +272,11 @@ def dashboard():
 @app.route('/api/activities')
 @login_required
 def api_activities():
-    cache         = load_cache()
     athlete_id    = str(session['athlete'].get('id', 'unknown'))
     cache_key     = f'activities_{athlete_id}'
     force_refresh = request.args.get('refresh') == 'true'
 
-    if cache_key not in cache or force_refresh:
+    if not cache_has(cache_key) or force_refresh:
         activities, page = [], 1
         while True:
             batch = strava('athlete/activities', {'per_page': 200, 'page': page})
@@ -230,10 +286,10 @@ def api_activities():
             if len(batch) < 200:
                 break
             page += 1
-        cache[cache_key] = {'activities': activities, 'fetched_at': datetime.now().isoformat()}
-        save_cache(cache)
+        cache_set(cache_key, {'activities': activities, 'fetched_at': datetime.now().isoformat()})
 
-    activities = cache[cache_key]['activities']
+    data       = cache_get(cache_key)
+    activities = data['activities'] if data else []
 
     # Filtri
     if request.args.get('commute') == 'true':
@@ -267,21 +323,18 @@ def api_activities():
 @app.route('/api/activity/<int:aid>/stream')
 @login_required
 def api_stream(aid):
-    cache = load_cache()
-    key   = f'stream_{aid}'
-
-    if key not in cache:
+    key = f'stream_{aid}'
+    if not cache_has(key):
         try:
             data = strava(
                 f'activities/{aid}/streams',
                 {'keys': 'latlng,time,velocity_smooth,altitude', 'key_by_type': 'true'}
             )
-            cache[key] = data
-            save_cache(cache)
+            cache_set(key, data)
         except Exception as e:
             return jsonify({'error': str(e)}), 400
 
-    return jsonify(cache[key])
+    return jsonify(cache_get(key))
 
 
 # ─── Helpers: soste e clustering ──────────────────────────────────────────────
@@ -394,14 +447,17 @@ def api_time_between_points():
     speed_threshold  = 0.5   # m/s ≈ 1.8 km/h
     min_stop_dur     = 10    # secondi
 
-    cache    = load_cache()
     results  = []
     segments = []          # sub-segmenti A→B con speed profile
     fetched  = 0           # contatore fetch live
 
+    # Carica tutti gli stream disponibili in un'unica richiesta batch
+    stream_keys = [f'stream_{aid}' for aid in activity_ids]
+    streams     = cache_get_many(stream_keys)
+
     for aid in activity_ids:
         key = f'stream_{aid}'
-        if key not in cache:
+        if key not in streams:
             if fetched >= MAX_LIVE_FETCH:
                 continue   # troppi da scaricare: salta, suggerisci pre-cache
             try:
@@ -409,12 +465,13 @@ def api_time_between_points():
                     f'activities/{aid}/streams',
                     {'keys': 'latlng,time,velocity_smooth', 'key_by_type': 'true'}
                 )
-                cache[key] = data
+                cache_set(key, data)
+                streams[key] = data
                 fetched += 1
             except:
                 continue
 
-        s = cache[key]
+        s = streams.get(key)
         if not s or 'latlng' not in s or 'time' not in s:
             continue
 
@@ -444,11 +501,9 @@ def api_time_between_points():
             'times':       times[idx_a:idx_b + 1],
         })
 
-    save_cache(cache)
-
     if not results:
         msg = 'Nessuna attività attraversa entrambi i punti.'
-        if fetched == 0 and any(f'stream_{i}' not in cache for i in activity_ids):
+        if fetched == 0 and any(not cache_has(f'stream_{i}') for i in activity_ids):
             msg += ' Usa "Pre-carica GPS" nella sidebar per scaricare gli stream prima.'
         return jsonify({'error': msg, 'results': []})
 
@@ -470,7 +525,7 @@ def api_time_between_points():
     min_count   = max(1, len(segments) // 4)   # almeno nel 25% delle attività
     freq_stops  = [st for st in clustered if st['count'] >= min_count]
 
-    skipped = len(activity_ids) - len(results) - (len(activity_ids) - len([i for i in activity_ids if f'stream_{i}' in cache]) - fetched)
+    skipped = len(activity_ids) - len(results) - fetched
 
     return jsonify({
         'results': sorted(results, key=lambda x: x['seconds']),
@@ -500,20 +555,18 @@ def api_stops():
     threshold = body.get('speed_threshold', 0.5)   # m/s ≈ 1.8 km/h
     min_dur   = body.get('min_duration', 5)         # secondi minimi per considerarla una sosta
 
-    cache = load_cache()
-    key   = f'stream_{aid}'
-    if key not in cache:
+    key = f'stream_{aid}'
+    if not cache_has(key):
         try:
             data = strava(
                 f'activities/{aid}/streams',
                 {'keys': 'latlng,time,velocity_smooth', 'key_by_type': 'true'}
             )
-            cache[key] = data
-            save_cache(cache)
+            cache_set(key, data)
         except Exception as e:
             return jsonify({'error': str(e)}), 400
 
-    s      = cache[key]
+    s      = cache_get(key)
     coords = s['latlng']['data']
     times  = s['time']['data']
     vels   = s.get('velocity_smooth', {}).get('data', [0] * len(times))
@@ -558,14 +611,14 @@ def api_stops():
 @app.route('/api/analyze/commute_stats')
 @login_required
 def api_commute_stats():
-    cache      = load_cache()
     athlete_id = str(session['athlete'].get('id', 'unknown'))
     key        = f'activities_{athlete_id}'
 
-    if key not in cache:
+    data = cache_get(key)
+    if not data:
         return jsonify({'error': 'Attività non ancora caricate.'}), 400
 
-    activities = [a for a in cache[key]['activities'] if a.get('commute')]
+    activities = [a for a in data['activities'] if a.get('commute')]
     if not activities:
         return jsonify({'error': 'Nessuna attività commute trovata.'}), 404
 
@@ -609,16 +662,16 @@ import time as time_mod
 
 _precache_state = {'running': False, 'done': 0, 'total': 0, 'errors': 0, 'log': []}
 
-def _precache_worker(activity_ids, token, cache):
+def _precache_worker(activity_ids, token):
     global _precache_state
     _precache_state.update({'running': True, 'done': 0, 'total': len(activity_ids),
                             'errors': 0, 'log': []})
-    headers = {'Authorization': f'Bearer {token}'}
+    headers     = {'Authorization': f'Bearer {token}'}
     batch_count = 0
 
     for aid in activity_ids:
         key = f'stream_{aid}'
-        if key in cache:
+        if cache_has(key):
             _precache_state['done'] += 1
             continue  # già in cache, salta
 
@@ -642,7 +695,7 @@ def _precache_worker(activity_ids, token, cache):
                                  params={'keys': 'latlng,time,velocity_smooth,altitude',
                                          'key_by_type': 'true'}, timeout=15)
             if r.ok:
-                cache[key] = r.json()
+                cache_set(key, r.json())   # salva subito su Supabase
                 batch_count += 1
             else:
                 _precache_state['errors'] += 1
@@ -652,7 +705,6 @@ def _precache_worker(activity_ids, token, cache):
 
         _precache_state['done'] += 1
 
-    save_cache(cache)
     _precache_state['running'] = False
     _precache_state['log'].append('✅ Pre-caricamento completato!')
 
@@ -664,23 +716,27 @@ def api_precache_start():
     if _precache_state['running']:
         return jsonify({'error': 'Pre-caricamento già in corso.'}), 409
 
-    cache      = load_cache()
     athlete_id = str(session['athlete'].get('id', 'unknown'))
     key        = f'activities_{athlete_id}'
 
-    if key not in cache:
-        return jsonify({'error': 'Carica prima la lista attività.'}), 400
+    data = cache_get(key)
+    if not data:
+        return jsonify({'error': 'Carica prima la lista attività (premi Aggiorna).'}), 400
 
     commute_only = request.json.get('commute_only', True)
-    acts = cache[key]['activities']
+    acts = data['activities']
     if commute_only:
         acts = [a for a in acts if a.get('commute')]
 
+    # Se non ci sono attività commute, usa tutte
+    if not acts:
+        acts = data['activities']
+
     ids    = [a['id'] for a in acts]
-    cached = sum(1 for i in ids if f'stream_{i}' in cache)
+    cached = sum(1 for i in ids if cache_has(f'stream_{i}'))
 
     token = session['access_token']
-    t = threading.Thread(target=_precache_worker, args=(ids, token, cache), daemon=True)
+    t = threading.Thread(target=_precache_worker, args=(ids, token), daemon=True)
     t.start()
 
     return jsonify({'started': True, 'total': len(ids), 'already_cached': cached})
