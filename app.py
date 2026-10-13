@@ -677,25 +677,55 @@ def api_commute_stats():
 import threading
 import time as time_mod
 
-_precache_state  = {'running': False, 'done': 0, 'total': 0, 'errors': 0, 'log': []}
-_precache_thread = None   # riferimento al thread corrente
+# Stato pre-cache persistito su file /tmp per essere condiviso tra i worker Gunicorn
+_PRECACHE_STATE_FILE = '/tmp/strava_precache_state.json'
+_precache_thread = None   # riferimento al thread corrente (solo nel worker che lo ha avviato)
+_precache_lock   = threading.Lock()
+
+
+def _read_precache_state():
+    """Legge lo stato del pre-cache dal file condiviso (qualsiasi worker)."""
+    try:
+        with open(_PRECACHE_STATE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {'running': False, 'done': 0, 'total': 0, 'errors': 0, 'log': []}
+
+
+def _write_precache_state(state):
+    """Scrive lo stato del pre-cache sul file condiviso (qualsiasi worker)."""
+    try:
+        with _precache_lock:
+            with open(_PRECACHE_STATE_FILE, 'w') as f:
+                json.dump(state, f)
+    except Exception as e:
+        print(f'[precache] state write error: {e}')
+
 
 def _precache_worker(activity_ids, token):
-    global _precache_state
-    _precache_state.update({'running': True, 'done': 0, 'total': len(activity_ids),
-                            'errors': 0, 'log': []})
+    state = {'running': True, 'done': 0, 'total': len(activity_ids), 'errors': 0, 'log': []}
+    _write_precache_state(state)
+
     headers     = {'Authorization': f'Bearer {token}'}
     batch_count = 0
 
     for aid in activity_ids:
+        # Controlla se è stato richiesto uno stop
+        current = _read_precache_state()
+        if not current.get('running'):
+            break
+
         key = f'stream_{aid}'
         if cache_has(key):
-            _precache_state['done'] += 1
+            state['done'] += 1
+            if state['done'] % 10 == 0:
+                _write_precache_state(state)
             continue  # già in cache, salta
 
         # Rispetta rate limit: pausa ogni 90 richieste
         if batch_count > 0 and batch_count % 90 == 0:
-            _precache_state['log'].append('⏳ Pausa 15 min per rate limit Strava…')
+            state['log'] = ['⏳ Pausa 15 min per rate limit Strava…']
+            _write_precache_state(state)
             time_mod.sleep(901)
 
         try:
@@ -706,7 +736,8 @@ def _precache_worker(activity_ids, token):
                 timeout=15
             )
             if r.status_code == 429:  # rate limited
-                _precache_state['log'].append('⏳ Rate limit raggiunto, attesa 15 min…')
+                state['log'] = ['⏳ Rate limit raggiunto, attesa 15 min…']
+                _write_precache_state(state)
                 time_mod.sleep(901)
                 r = requests.get(f'{STRAVA_API}/activities/{aid}/streams',
                                  headers=headers,
@@ -716,41 +747,48 @@ def _precache_worker(activity_ids, token):
                 cache_set(key, r.json())   # salva subito su Supabase
                 batch_count += 1
             else:
-                _precache_state['errors'] += 1
+                state['errors'] += 1
         except Exception as e:
-            _precache_state['errors'] += 1
-            _precache_state['log'].append(f'Errore {aid}: {e}')
+            state['errors'] += 1
+            state['log'] = [f'Errore {aid}: {e}']
 
-        _precache_state['done'] += 1
+        state['done'] += 1
+        # Aggiorna il file ogni 5 attività (non ogni volta per non saturare I/O)
+        if state['done'] % 5 == 0:
+            _write_precache_state(state)
 
-    _precache_state['running'] = False
-    _precache_state['log'].append('✅ Pre-caricamento completato!')
+    state['running'] = False
+    state['log'] = [f'✅ Pre-caricamento completato! ({state["done"]} stream salvati)']
+    _write_precache_state(state)
 
 
 @app.route('/api/precache/stop', methods=['POST'])
 @login_required
 def api_precache_stop():
     """Forza il reset del pre-cache (utile se il thread è bloccato)."""
-    global _precache_state, _precache_thread
-    _precache_state['running'] = False
-    _precache_state['log'].append('⛔ Interrotto manualmente.')
-    # Il thread daemon terminerà da solo alla prossima iterazione o al riavvio
+    state = _read_precache_state()
+    state['running'] = False
+    state['log'] = ['⛔ Interrotto manualmente.']
+    _write_precache_state(state)
     return jsonify({'stopped': True})
 
 
 @app.route('/api/precache/start', methods=['POST'])
 @login_required
 def api_precache_start():
-    global _precache_state, _precache_thread
+    global _precache_thread
 
-    # Se il thread è marcato "running" ma è effettivamente morto → reset automatico
-    if _precache_state['running']:
-        if _precache_thread is not None and not _precache_thread.is_alive():
-            _precache_state['running'] = False
-            _precache_state['log'].append('⚠️ Thread precedente terminato inaspettatamente, riavvio…')
+    state = _read_precache_state()
+
+    # Se risulta "running" nel file condiviso, controlla se il thread è vivo in questo worker
+    if state.get('running'):
+        if _precache_thread is not None and _precache_thread.is_alive():
+            # Thread davvero in corso: il frontend riprende il polling
+            return jsonify({**state, 'already_running': True}), 409
         else:
-            # Thread vivo: restituiamo lo stato corrente con 409 (il frontend riprende il polling)
-            return jsonify({**_precache_state, 'already_running': True}), 409
+            # File dice running ma thread non c'è (altro worker o crash) → reset
+            state['running'] = False
+            _write_precache_state(state)
 
     athlete_id = str(session['athlete'].get('id', 'unknown'))
     key        = f'activities_{athlete_id}'
@@ -793,7 +831,7 @@ def api_precache_start():
 @app.route('/api/precache/status')
 @login_required
 def api_precache_status():
-    return jsonify(_precache_state)
+    return jsonify(_read_precache_state())
 
 
 if __name__ == '__main__':

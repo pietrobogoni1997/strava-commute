@@ -622,7 +622,8 @@ function startPrecachePolling() {
         $('btnPrecache').disabled = false;
         $('btnPrecache').textContent = '✓ Fatto';
         $('btnPrecacheStop').style.display = 'none';
-        $('precacheLog').textContent = `✅ ${st.done} attività in cache — analisi ora istantanea!`;
+        const lastLog = st.log && st.log.length ? st.log[st.log.length - 1] : `✅ ${st.done} stream in cache`;
+        $('precacheLog').textContent = lastLog;
       }
     } catch(e) { /* ignora errori di polling */ }
   }, 1500);
