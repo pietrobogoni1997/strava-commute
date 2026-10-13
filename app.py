@@ -56,22 +56,35 @@ def _sb_headers():
     }
 
 def _ensure_index():
-    """Carica l'indice delle chiavi da Supabase (una volta per worker)."""
+    """Carica l'indice delle chiavi da Supabase con paginazione (una volta per worker).
+    Usa Range header per superare il limite max-rows di PostgREST (default 1000).
+    """
     global _sb_known, _cache_ready
     if _cache_ready:
         return
     _cache_ready = True
     if SUPABASE_URL and SUPABASE_KEY:
         try:
-            r = requests.get(
-                f'{SUPABASE_URL}/rest/v1/cache_store?select=key&limit=200000',
-                headers=_sb_headers(), timeout=20
-            )
-            if r.ok:
-                _sb_known.update(row['key'] for row in r.json())
-                print(f'[cache] Index caricato: {len(_sb_known)} chiavi in Supabase')
-            else:
-                print(f'[cache] Index error: {r.status_code} {r.text[:200]}')
+            PAGE = 1000
+            offset = 0
+            while True:
+                r = requests.get(
+                    f'{SUPABASE_URL}/rest/v1/cache_store?select=key',
+                    headers={**_sb_headers(),
+                             'Range-Unit': 'items',
+                             'Range': f'{offset}-{offset + PAGE - 1}'},
+                    timeout=20
+                )
+                if r.ok:
+                    rows = r.json()
+                    _sb_known.update(row['key'] for row in rows)
+                    if len(rows) < PAGE:
+                        break          # ultima pagina
+                    offset += PAGE
+                else:
+                    print(f'[cache] Index page error: {r.status_code} {r.text[:200]}')
+                    break
+            print(f'[cache] Index caricato: {len(_sb_known)} chiavi in Supabase')
         except Exception as e:
             print(f'[cache] _ensure_index error: {e}')
     else:
@@ -147,15 +160,19 @@ def cache_set(key: str, value) -> bool:
     _mem_cache[key] = value
     if SUPABASE_URL and SUPABASE_KEY:
         try:
-            requests.post(
+            r = requests.post(
                 f'{SUPABASE_URL}/rest/v1/cache_store',
                 headers={**_sb_headers(),
                          'Prefer': 'resolution=merge-duplicates,return=minimal'},
                 json={'key': key, 'value': value},
                 timeout=30
             )
-            _sb_known.add(key)
-            return True
+            if r.ok:
+                _sb_known.add(key)
+                return True
+            else:
+                print(f'[cache] set({key}) HTTP {r.status_code}: {r.text[:200]}')
+                return False
         except Exception as e:
             print(f'[cache] set({key}) error: {e}')
             return False
